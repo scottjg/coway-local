@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 from importlib.metadata import version
 
 from amqtt.broker import Broker
@@ -19,6 +20,7 @@ from amqtt.mqtt.protocol.broker_handler import BrokerProtocolHandler
 from .const import SERVICE_CODE
 
 AMQTT_VERSION = version("amqtt")
+_LOGGER = logging.getLogger(__name__)
 
 
 def topic(kind: str, serial: str) -> str:
@@ -27,7 +29,9 @@ def topic(kind: str, serial: str) -> str:
 
 
 def publications(serial):
-    return {topic(kind, serial) for kind in ("MITG", "MITGLWT", "BEvent")}
+    # The AP-1022K reports on BEvent. The hotspot-setup AP-1720G (02F9R) reports
+    # the same messages on MEvent.
+    return {topic(kind, serial) for kind in ("MITG", "MITGLWT", "BEvent", "MEvent")}
 
 
 def subscriptions(serial):
@@ -66,6 +70,7 @@ class CowayBroker(Broker):
         self.on_ready = on_ready
         self.on_disconnect = on_disconnect
         self.closing = False
+        self.dropped = set()
         super().__init__(config)
 
     def _create_ssl_context(self, listener):
@@ -166,13 +171,14 @@ class CowayBroker(Broker):
         message = waiter.result()
         if message is None:
             return True
-        if (
-            self.closing
-            or len(message.data) > 32768
-            or not await self._topic_filtering(session, message.topic, Action.PUBLISH)
+        if self.closing:
+            return True
+        if len(message.data) > 32768 or not await self._topic_filtering(
+            session, message.topic, Action.PUBLISH
         ):
             # Drop unauthorized data without abandoning a running protocol
             # handler (the upstream loop's False path does not close it).
+            self._report_dropped(session, message.topic)
             return True
         # Own exact BEvent is allowed; all other reserved topics fail the ACL.
         await self.plugins_manager.fire_event(
@@ -183,6 +189,18 @@ class CowayBroker(Broker):
         # fan is allowed to subscribe to them. MQTT acknowledgements remain in
         # aMQTT's protocol handler.
         return True
+
+    def _report_dropped(self, session, name):
+        """Say once per fan and topic what was dropped, without the fan's identity.
+
+        A fan that reports on an unexpected topic otherwise just looks offline.
+        """
+        key = (session.client_id, name)
+        if key in self.dropped or len(self.dropped) >= 256:
+            return
+        self.dropped.add(key)
+        shown = name.replace(session.client_id, "<serial>") if session.client_id else name
+        _LOGGER.warning("Dropped a fan publication on %s, which the broker does not accept", shown)
 
     async def publish_command(self, serial, payload):
         if self.closing:

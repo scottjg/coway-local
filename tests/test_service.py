@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import ssl
 import time
 from dataclasses import replace
@@ -92,6 +93,24 @@ async def test_enrollment_is_temporary_and_https_only(service):
             assert response.status == 403
 
 
+async def test_certificate_server_replies_in_compact_json(service):
+    # The hotspot-setup AP-1720G (02F9R) rejects a reply written with spaces.
+    pairing = service.begin_pairing()
+    tls = await asyncio.to_thread(ssl.create_default_context, cafile=service.root / "ca.pem")
+    url = service.setup_bundle(pairing)["certSvrUrl"] + "/VGVzdCBmYW4"
+    mac = "001122334455"
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=tls)) as client:
+        for body, status in (
+            ({}, 403),
+            ({"certToken": pairing.token, "serial": local_serial(mac), "macAddr": mac}, 200),
+        ):
+            async with client.post(url, json=body) as response:
+                assert response.status == status
+                text = await response.text()
+            assert text == json.dumps(json.loads(text), separators=(",", ":"))
+            assert ('"success":true' if status == 200 else '"success":false') in text
+
+
 async def test_fan_commands_reserved_events_and_acknowledgements(service, fan):
     assert service.states[fan.serial].online
     assert not service.pairings and not service.downloads
@@ -165,12 +184,35 @@ async def test_wrong_direction_publications_are_dropped(service, fan):
     for denied in (
         topic("MControl", fan.serial),
         topic("BEvent", "LOCAL0001122334466"),
+        topic("MEvent", "LOCAL0001122334466"),
         "$SYS/test",
     ):
         await asyncio.to_thread(fan.publish, denied, forged)
     await asyncio.sleep(0.05)
     assert service.states[fan.serial].settings["0003"] == original
     await service.set(fan.serial, "speed", "2")
+
+
+async def test_reports_on_mevent_are_accepted(service, fan):
+    # The hotspot-setup AP-1720G (02F9R) reports on MEvent instead of BEvent.
+    report = {"header": {"prodId": fan.serial, "API_NO": "A1010"}, "attributes": {}}
+    for speed in (3, 2):
+        report["attributes"] = {"A1010.0003": speed}
+        await asyncio.to_thread(fan.publish, topic("MEvent", fan.serial), json.dumps(report))
+        await eventually(lambda: service.states[fan.serial].settings["0003"] == speed)
+
+
+async def test_dropped_publications_are_reported_once_without_identity(service, fan, caplog):
+    caplog.set_level(logging.WARNING, logger="custom_components.coway_local.broker")
+    for _ in range(3):
+        await asyncio.to_thread(fan.publish, topic("MUnknown", fan.serial), "{}")
+    # A command round trip shows the broker has handled the publications.
+    await service.set(fan.serial, "speed", "2")
+    messages = [r.getMessage() for r in caplog.records if r.name.endswith(".broker")]
+    assert messages == [
+        "Dropped a fan publication on IoCare/MUnknown/002AIR007/<serial>, "
+        "which the broker does not accept"
+    ]
 
 
 async def test_persistence_reload_and_removal(service, fan):

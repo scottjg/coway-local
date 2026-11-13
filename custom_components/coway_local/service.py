@@ -266,7 +266,15 @@ class LocalService:
 
     @staticmethod
     def response(body, status=200):
-        return web.json_response(body, status=status, headers={"Cache-Control": "no-store"})
+        # Compact, as the fans write it: the hotspot-setup AP-1720G (02F9R)
+        # rejects an enrollment reply with spaces and enrolls again every ten
+        # seconds without downloading its certificate.
+        return web.json_response(
+            body,
+            status=status,
+            headers={"Cache-Control": "no-store"},
+            dumps=lambda value: json.dumps(value, separators=(",", ":")),
+        )
 
     def rejected(self, status, message):
         return self.response(
