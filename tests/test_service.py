@@ -8,11 +8,12 @@ from dataclasses import replace
 import aiohttp
 import pytest
 
+from custom_components.coway_local import service as service_module
 from custom_components.coway_local.broker import topic
 from custom_components.coway_local.const import SETTINGS
 from custom_components.coway_local.service import LocalService, ServerConfig, local_serial
 
-from .conftest import Fan, enroll, eventually
+from .conftest import Fan, SilentFan, enroll, eventually, tls_connection
 
 
 async def test_setup_token_is_bound_to_one_mac_on_first_enrollment(service):
@@ -254,6 +255,58 @@ async def test_partial_start_failure_releases_listeners(service, tmp_path):
     await service.stop()
     await failed.start()
     await failed.stop()
+
+
+async def test_reconnect_closes_the_connection_it_replaces(service):
+    await enroll(service)
+    first = await asyncio.to_thread(SilentFan, service.root, service.config.mqtt_port)
+    second = await asyncio.to_thread(SilentFan, service.root, service.config.mqtt_port)
+    try:
+        assert await asyncio.to_thread(first.closed.wait, 4)
+        assert not second.closed.is_set()
+        (listener,) = service.broker._servers.values()
+        await eventually(lambda: listener.conn_count == 1)
+        await eventually(lambda: service.states["LOCAL0001122334455"].online)
+    finally:
+        first.close()
+        second.close()
+
+
+async def test_stop_does_not_wait_for_unresponsive_connections(service):
+    await enroll(service)
+    # This fan has stopped reading: it neither acknowledges the QoS 1 refresh
+    # sent when it subscribes nor answers when the broker closes the connection.
+    dead = await asyncio.to_thread(SilentFan, service.root, service.config.mqtt_port, reading=False)
+    # This connection never sends CONNECT, so aMQTT never tracks it.
+    idle = await asyncio.to_thread(tls_connection, service.root, service.config.mqtt_port)
+    try:
+        await eventually(lambda: service.states["LOCAL0001122334455"].online)
+        started = time.monotonic()
+        async with asyncio.timeout(10):
+            await service.stop()
+        assert time.monotonic() - started < 3
+    finally:
+        dead.close()
+        idle.close()
+
+
+async def test_stop_gives_up_on_a_step_that_hangs(service, monkeypatch, caplog):
+    monkeypatch.setattr(service_module, "STOP_STEP_SECONDS", 0.2)
+    broker = service.broker
+    shutdown = broker.shutdown
+
+    async def hang():
+        await shutdown()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(broker, "shutdown", hang)
+    async with asyncio.timeout(3):
+        await service.stop()
+    assert "Stopping the MQTT broker took over 0.2 seconds" in caplog.text
+    # The steps after the one that hung still ran.
+    assert not service.runners
+    with pytest.raises(OSError):
+        await asyncio.open_connection("127.0.0.1", service.config.http_port)
 
 
 @pytest.mark.parametrize(

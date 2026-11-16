@@ -34,6 +34,7 @@ from .telemetry import decode_report
 
 _LOGGER = logging.getLogger(__name__)
 MAC = re.compile(r"[0-9A-F]{12}\Z")
+STOP_STEP_SECONDS = 10
 
 
 def local_serial(mac: str) -> str:
@@ -196,25 +197,44 @@ class LocalService:
             if not future.done():
                 future.set_exception(ConnectionError("Local service stopped"))
         self.pending.clear()
-        for task in tuple(self.tasks):
+        tasks, self.tasks = tuple(self.tasks), set()
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*tuple(self.tasks), return_exceptions=True)
-        self.tasks.clear()
-        if self.broker:
-            try:
-                await self.broker.shutdown()
-            except Exception:
-                _LOGGER.exception("Error stopping the Coway broker")
-            self.broker = None
-        for runner in reversed(self.runners):
-            await runner.cleanup()
-        self.runners.clear()
+        # Taken before awaiting, so a second stop() running alongside (a reload
+        # during HA shutdown) does not shut the same broker or runner down twice.
+        broker, self.broker = self.broker, None
+        runners, self.runners = self.runners, []
+        await self.stop_step("background tasks", asyncio.gather(*tasks, return_exceptions=True))
+        if broker:
+            await self.stop_step("the MQTT broker", broker.shutdown())
+        for runner in reversed(runners):
+            await self.stop_step("a web listener", runner.cleanup())
         for pairing in tuple(self.pairings.values()):
             self.cancel_pairing(pairing)
         self.downloads.clear()
         for serial, state in self.states.items():
             state.online = False
             self.changed(serial)
+
+    @staticmethod
+    async def stop_step(name, awaitable):
+        """Await one step of stop(), giving up after STOP_STEP_SECONDS.
+
+        HA waits on stop() at shutdown and on unload, so no step may hang it.
+        """
+        timeout = asyncio.timeout(STOP_STEP_SECONDS)
+        try:
+            async with timeout:
+                await awaitable
+        except Exception:
+            if timeout.expired():
+                _LOGGER.warning(
+                    "Stopping %s took over %s seconds; continuing without it",
+                    name,
+                    STOP_STEP_SECONDS,
+                )
+            else:
+                _LOGGER.exception("Error stopping %s", name)
 
     async def save(self):
         # Callers hold enrollment_lock for identity and confirmed-setting changes.

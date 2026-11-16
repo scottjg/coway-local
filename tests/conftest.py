@@ -1,9 +1,12 @@
 import asyncio
 import base64
+import contextlib
 import json
 import queue
 import socket
 import ssl
+import struct
+import threading
 
 import aiohttp
 import paho.mqtt.client as mqtt
@@ -149,6 +152,65 @@ class Fan:
     def close(self):
         self.client.disconnect()
         self.client.loop_stop()
+
+
+def mqtt_packet(kind, body):
+    length, encoded = len(body), b""
+    while True:
+        byte, length = length % 128, length // 128
+        encoded += bytes([byte | (0x80 if length else 0)])
+        if not length:
+            return bytes([kind]) + encoded + body
+
+
+def mqtt_string(value):
+    return struct.pack("!H", len(value)) + value.encode()
+
+
+def tls_connection(root, port, serial="LOCAL0001122334455"):
+    """A fan's TLS connection to the broker, before any MQTT."""
+    context = ssl.create_default_context(cafile=root / "ca.pem")
+    context.load_cert_chain(root / "devices" / f"{serial}.pem", root / "devices" / f"{serial}.key")
+    context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_2
+    context.set_ciphers("AES128-SHA256")
+    return context.wrap_socket(
+        socket.create_connection(("127.0.0.1", port), timeout=4), server_hostname="127.0.0.1"
+    )
+
+
+class SilentFan:
+    """A raw MQTT client that subscribes, then acknowledges nothing.
+
+    With reading=False it also stops reading the socket, which is how a fan
+    whose link died without closing the connection looks to the broker.
+    """
+
+    def __init__(self, root, port, serial="LOCAL0001122334455", reading=True):
+        self.reading = reading
+        self.closed = threading.Event()
+        self.sock = tls_connection(root, port, serial)
+        connect = mqtt_string("MQTT") + bytes([4, 0x02]) + struct.pack("!H", 60)
+        self.sock.sendall(mqtt_packet(0x10, connect + mqtt_string(serial)))
+        assert self.sock.recv(4) == b"\x20\x02\x00\x00"
+        subscribe = struct.pack("!H", 1) + mqtt_string(topic("MControl", serial)) + b"\x01"
+        self.sock.sendall(mqtt_packet(0x82, subscribe))
+        assert self.sock.recv(5) == b"\x90\x03\x00\x01\x01"
+        self.sock.settimeout(None)
+        threading.Thread(target=self.drain, daemon=True).start()
+
+    def drain(self):
+        if not self.reading:
+            return
+        try:
+            while self.sock.recv(4096):
+                pass
+        except OSError:
+            pass
+        self.closed.set()
+
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.sock.close()
 
 
 @pytest.fixture

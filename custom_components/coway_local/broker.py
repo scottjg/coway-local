@@ -6,6 +6,7 @@ See LICENSE.amqtt. Private hooks are deliberately version-pinned and wire-tested
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import logging
@@ -20,6 +21,7 @@ from amqtt.mqtt.protocol.broker_handler import BrokerProtocolHandler
 from .const import SERVICE_CODE
 
 AMQTT_VERSION = version("amqtt")
+CLOSE_GRACE_SECONDS = 1
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -112,7 +114,15 @@ class CowayBroker(Broker):
             await self._close(writer)
             raise MQTTError("Invalid device will topic")
         if session.clean_session:
+            # aMQTT's _delete_session forgets the previous connection without
+            # closing it, and its broker never enforces keepalive, so a fan that
+            # reconnects after its link died would leave that connection open for
+            # good. End it the way aMQTT's own takeover does: its loop then
+            # stops the handler and closes the socket in its own task.
+            _, previous = self._sessions.get(session.client_id, (None, None))
             await self._delete_session(session.client_id)
+            if previous is not None:
+                await previous.handle_connection_closed()
             session.parent = 0
         elif session.client_id in self._sessions:
             existing, _ = self._sessions[session.client_id]
@@ -218,4 +228,19 @@ class CowayBroker(Broker):
 
     async def shutdown(self):
         self.closing = True
+        # aMQTT's shutdown ends with asyncio's Server.wait_closed(), which waits
+        # for every connection the listener accepted, including those aMQTT no
+        # longer tracks (one that never sent CONNECT, one a reconnect replaced),
+        # and a TLS close to a fan that has gone away only gives up after 30 s.
+        # Close them all here first: gracefully if the fan answers promptly,
+        # otherwise by aborting the connection.
+        listeners = [server.instance for server in self._servers.values() if server.instance]
+        for listener in listeners:
+            listener.close()
+            listener.close_clients()
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(CLOSE_GRACE_SECONDS):
+                await asyncio.gather(*(listener.wait_closed() for listener in listeners))
+        for listener in listeners:
+            listener.abort_clients()
         await super().shutdown()
